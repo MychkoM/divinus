@@ -442,85 +442,92 @@ int v1_video_create(char index, hal_vidconfig *config)
     int ret;
     v1_venc_chn channel;
     v1_venc_attr_h264 *attrib;
+
+    // HI_MPI_VENC_CreateGroup on hi3518ev100 (MPP V1.0.B.0) clobbers the
+    // callee-saved register holding `config` (observed: valid pointer before
+    // the call, NULL right after). Copy every field we need up front so the
+    // SDK calls below never dereference the original pointer again.
+    hal_vidconfig cfg = *config;
+
     memset(&channel, 0, sizeof(channel));
 
-    if (config->codec == HAL_VIDCODEC_JPG) {
+    if (cfg.codec == HAL_VIDCODEC_JPG) {
         channel.attrib.codec = V1_VENC_CODEC_JPEG;
-        channel.attrib.jpg.maxPic.width = config->width;
-        channel.attrib.jpg.maxPic.height = config->height;
+        channel.attrib.jpg.maxPic.width = cfg.width;
+        channel.attrib.jpg.maxPic.height = cfg.height;
         channel.attrib.jpg.bufSize =
-            ALIGN_UP(config->height, 16) * ALIGN_UP(config->width, 16);
+            ALIGN_UP(cfg.height, 16) * ALIGN_UP(cfg.width, 16);
         channel.attrib.jpg.byFrame = 0;
         channel.attrib.jpg.fieldOrFrame = 0;
         channel.attrib.jpg.priority = 0;
-        channel.attrib.jpg.pic.width = config->width;
-        channel.attrib.jpg.pic.height = config->height;
+        channel.attrib.jpg.pic.width = cfg.width;
+        channel.attrib.jpg.pic.height = cfg.height;
         goto attach;
-    } else if (config->codec == HAL_VIDCODEC_MJPG) {
+    } else if (cfg.codec == HAL_VIDCODEC_MJPG) {
         channel.attrib.codec = V1_VENC_CODEC_MJPG;
-        channel.attrib.mjpg.maxPic.width = config->width;
-        channel.attrib.mjpg.maxPic.height = config->height;
+        channel.attrib.mjpg.maxPic.width = cfg.width;
+        channel.attrib.mjpg.maxPic.height = cfg.height;
         channel.attrib.mjpg.bufSize =
-            ALIGN_UP(config->height, 16) * ALIGN_UP(config->width, 16);
+            ALIGN_UP(cfg.height, 16) * ALIGN_UP(cfg.width, 16);
         channel.attrib.mjpg.byFrame = 0;
         channel.attrib.mjpg.mainStrmOn = 1;
         channel.attrib.mjpg.fieldOrFrame = 0;
         channel.attrib.mjpg.priority = 0;
-        channel.attrib.mjpg.pic.width = config->width;
-        channel.attrib.mjpg.pic.height = config->height;
-        switch (config->mode) {
+        channel.attrib.mjpg.pic.width = cfg.width;
+        channel.attrib.mjpg.pic.height = cfg.height;
+        switch (cfg.mode) {
             case HAL_VIDMODE_CBR:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGCBR;
-                channel.rate.mjpgCbr = (v1_venc_rate_mjpgcbr){ .statTime = 1, .srcFps = config->framerate,
-                    .dstFps = config->framerate, .bitrate = config->bitrate, .avgLvl = 0 }; break;
+                channel.rate.mjpgCbr = (v1_venc_rate_mjpgcbr){ .statTime = 1, .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate, .bitrate = cfg.bitrate, .avgLvl = 0 }; break;
             case HAL_VIDMODE_VBR:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGVBR;
-                channel.rate.mjpgVbr = (v1_venc_rate_mjpgvbr){ .statTime = 1, .srcFps = config->framerate,
-                    .dstFps = config->framerate , .maxBitrate = MAX(config->bitrate, config->maxBitrate),
-                    .maxQual = config->maxQual, .minQual = config->maxQual }; break;
+                channel.rate.mjpgVbr = (v1_venc_rate_mjpgvbr){ .statTime = 1, .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate , .maxBitrate = MAX(cfg.bitrate, cfg.maxBitrate),
+                    .maxQual = cfg.maxQual, .minQual = cfg.maxQual }; break;
             case HAL_VIDMODE_QP:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGQP;
-                channel.rate.mjpgQp = (v1_venc_rate_mjpgqp){ .srcFps = config->framerate,
-                    .dstFps = config->framerate, .quality = config->maxQual }; break;
+                channel.rate.mjpgQp = (v1_venc_rate_mjpgqp){ .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate, .quality = cfg.maxQual }; break;
             default:
                 HAL_ERROR("v1_venc", "MJPEG encoder can only support CBR, VBR or fixed QP modes!");
         }
         goto attach;
-    } else if (config->codec == HAL_VIDCODEC_H264) {
+    } else if (cfg.codec == HAL_VIDCODEC_H264) {
         channel.attrib.codec = V1_VENC_CODEC_H264;
         attrib = &channel.attrib.h264;
-        switch (config->mode) {
+        switch (cfg.mode) {
             case HAL_VIDMODE_CBR:
                 channel.rate.mode = V1_VENC_RATEMODE_H264CBRv2;
-                channel.rate.h264Cbr = (v1_venc_rate_h264cbr){ .gop = config->gop,
-                    .statTime = 1, .srcFps = config->framerate, .dstFps = config->framerate,
-                    .bitrate = config->bitrate, .avgLvl = 0 }; break;
+                channel.rate.h264Cbr = (v1_venc_rate_h264cbr){ .gop = cfg.gop,
+                    .statTime = 1, .srcFps = cfg.framerate, .dstFps = cfg.framerate,
+                    .bitrate = cfg.bitrate, .avgLvl = 0 }; break;
             case HAL_VIDMODE_VBR:
                 channel.rate.mode = V1_VENC_RATEMODE_H264VBRv2;
-                channel.rate.h264Vbr = (v1_venc_rate_h264vbr){ .gop = config->gop,
-                    .statTime = 1, .srcFps = config->framerate, .dstFps = config->framerate,
-                    .maxBitrate = MAX(config->bitrate, config->maxBitrate), .maxQual = config->maxQual,
-                    .minQual = config->minQual }; break;
+                channel.rate.h264Vbr = (v1_venc_rate_h264vbr){ .gop = cfg.gop,
+                    .statTime = 1, .srcFps = cfg.framerate, .dstFps = cfg.framerate,
+                    .maxBitrate = MAX(cfg.bitrate, cfg.maxBitrate), .maxQual = cfg.maxQual,
+                    .minQual = cfg.minQual }; break;
             case HAL_VIDMODE_QP:
                 channel.rate.mode = V1_VENC_RATEMODE_H264QP;
-                channel.rate.h264Qp = (v1_venc_rate_h264qp){ .gop = config->gop,
-                    .srcFps = config->framerate, .dstFps = config->framerate, .interQual = config->maxQual,
-                    .predQual = config->minQual }; break;
+                channel.rate.h264Qp = (v1_venc_rate_h264qp){ .gop = cfg.gop,
+                    .srcFps = cfg.framerate, .dstFps = cfg.framerate, .interQual = cfg.maxQual,
+                    .predQual = cfg.minQual }; break;
             default:
                 HAL_ERROR("v1_venc", "H.264 encoder does not support this mode!");
         }
     } else HAL_ERROR("v1_venc", "This codec is not supported by the hardware!");
-    attrib->maxPic.width = config->width;
-    attrib->maxPic.height = config->height;
-    attrib->bufSize = config->width * config->height;
-    attrib->profile = MIN(config->profile, 1);
+    attrib->maxPic.width = cfg.width;
+    attrib->maxPic.height = cfg.height;
+    attrib->bufSize = cfg.width * cfg.height;
+    attrib->profile = MIN(cfg.profile, 1);
     attrib->byFrame = 0;
     attrib->fieldOn = 0;
     attrib->mainStrmOn = 1;
     attrib->priority = 0;
     attrib->fieldOrFrame = 0;
-    attrib->pic.width = config->width;
-    attrib->pic.height = config->height;
+    attrib->pic.width = cfg.width;
+    attrib->pic.height = cfg.height;
 attach:
     if (ret = v1_venc.fnCreateGroup(index))
         return ret;
@@ -531,11 +538,11 @@ attach:
     if (ret = v1_venc.fnRegisterChannel(index, index))
         return ret;
 
-    if (config->codec != HAL_VIDCODEC_JPG &&
+    if (cfg.codec != HAL_VIDCODEC_JPG &&
         (ret = v1_venc.fnStartReceiving(index)))
         return ret;
 
-    v1_state[index].payload = config->codec;
+    v1_state[index].payload = cfg.codec;
 
     return EXIT_SUCCESS;
 }
@@ -757,7 +764,7 @@ void *v1_video_thread(void)
                     }
                     stream.count = stat.curPacks;
 
-                    if (ret = v1_venc.fnGetStream(i, &stream, 40)) {
+                    if (ret = v1_venc.fnGetStream(i, &stream, 1)) {
                         HAL_DANGER("v1_venc", "Getting the stream on "
                             "channel %d failed with %#x!\n", i, ret);
                         if (stat.curPacks > 8) free(stream.packet);

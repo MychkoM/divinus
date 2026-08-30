@@ -1,5 +1,5 @@
 system:
-  sensor_config: /etc/sensors/imx415.bin
+  sensor_config: /etc/sensors/sc1035_960p.ini
   web_port: 80
   web_enable_auth: false
   web_auth_user: admin
@@ -18,7 +18,7 @@ isp:
   antiflicker: 60
 
 osd:
-  enable: true
+  enable: false
 
 mdns:
   enable: false
@@ -52,14 +52,16 @@ stream:
 
 night_mode:
   enable: false
-  ir_sensor_pin: 62
+  #ir_sensor_pin: 62
   check_interval_s: 10
-  ir_cut_pin1: 1
-  ir_cut_pin2: 2
-  ir_led_pin: 3
+  # Netis SEC111: IR-cut pins wired to SoC GPIO 4 and 2 (see netis-sec111.md);
+  # IR LED is autonomous (photoresistor in its power circuit), no SoC pin.
+  #ir_cut_pin1: 4
+  #ir_cut_pin2: 2
+  #ir_led_pin: 999
   pin_switch_delay_us: 150
-  adc_device: /dev/sar_adc_drv
-  adc_threshold: 128
+  #adc_device: /dev/sar_adc_drv
+  #adc_threshold: 128
 
 http_post:
   enable: false
@@ -81,8 +83,8 @@ mp4:
   enable: true
   codec: H264
   mode: CBR
-  width: 3840
-  height: 2160
+  width: 1280
+  height: 960
   fps: 20
   gop: 40
   bitrate: 1024
@@ -90,14 +92,14 @@ mp4:
 
 jpeg:
   enable: false
-  width: 1920
-  height: 1080
+  width: 1280
+  height: 960
   qfactor: 70
 
 mjpeg:
-  enable: true
+  enable: false
   mode: CBR
-  width: 3840
-  height: 2160
+  width: 1280
+  height: 960
   fps: 20
   bitrate: 1024

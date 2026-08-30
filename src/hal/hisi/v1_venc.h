@@ -187,6 +187,7 @@ typedef struct {
 } v1_venc_pack;
 
 typedef struct {
+    int registered;
     unsigned int leftPics;
     unsigned int leftBytes;
     unsigned int leftFrames;
