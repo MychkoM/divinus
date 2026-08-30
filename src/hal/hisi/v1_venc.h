@@ -187,6 +187,7 @@ typedef struct {
 } v1_venc_pack;
 
 typedef struct {
+    int registered;
     unsigned int leftPics;
     unsigned int leftBytes;
     unsigned int leftFrames;
@@ -239,7 +240,8 @@ typedef struct {
     int (*fnGetChannelConfig)(int channel, v1_venc_chn *config);
     int (*fnDestroyChannel)(int channel);
     int (*fnSetChannelConfig)(int channel, v1_venc_chn *config);
-    int (*fnSetColorToGray)(int channel, int *active);
+    int (*fnSetColorToGray)(int group, const int *active);
+    int (*fnSetColorToGrayConf)(const void *conf);
 
     int (*fnGetDescriptor)(int channel);
 
@@ -293,7 +295,11 @@ static int v1_venc_load(v1_venc_impl *venc_lib) {
         hal_symbol_load("v1_venc", venc_lib->handle, "HI_MPI_VENC_SetChnAttr")))
         return EXIT_FAILURE;
 
-    if (!(venc_lib->fnSetColorToGray = (int(*)(int channel, int *active))
+    if (!(venc_lib->fnSetColorToGray = (int(*)(int group, const int *active))
+        hal_symbol_load("v1_venc", venc_lib->handle, "HI_MPI_VENC_SetGrpColor2Grey")))
+        return EXIT_FAILURE;
+
+    if (!(venc_lib->fnSetColorToGrayConf = (int(*)(const void *conf))
         hal_symbol_load("v1_venc", venc_lib->handle, "HI_MPI_VENC_SetColor2GreyConf")))
         return EXIT_FAILURE;
 

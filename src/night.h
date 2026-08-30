@@ -26,3 +26,6 @@ void night_mode(bool enable);
 
 void night_disable(void);
 int night_enable(void);
+
+/* [divinus-142] last AE-based light reading (light_source: sensor) */
+int night_light_last(int *lines, int *tier, int *dark);

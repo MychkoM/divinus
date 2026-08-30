@@ -82,6 +82,16 @@ typedef struct {
     v1_common_rect rect;
 } v1_vi_dev;
 
+// VI color-space attr (hi_comm_vi.h VI_CSC_ATTR_S); saturation=0 is the
+// majestic way of doing night grayscale — ISP-side, VENC stays untouched.
+typedef struct {
+    int type;             /* VI_CSC_TYPE_E: 601/709 */
+    unsigned luma;        /* 0..100 */
+    unsigned contr;       /* 0..100 */
+    unsigned hue;         /* 0..100 */
+    unsigned satu;        /* 0..100 */
+} v1_vi_csc;
+
 typedef struct {
     void *handle;
 
@@ -92,6 +102,10 @@ typedef struct {
     int (*fnDisableChannel)(int channel);
     int (*fnEnableChannel)(int channel);
     int (*fnSetChannelConfig)(int channel, v1_vi_chn *config);
+
+    // Optional (older firmware may lack them):
+    int (*fnGetCSCAttr)(int device, v1_vi_csc *csc);
+    int (*fnSetCSCAttr)(int device, const v1_vi_csc *csc);
 } v1_vi_impl;
 
 static int v1_vi_load(v1_vi_impl *vi_lib) {
@@ -121,6 +135,11 @@ static int v1_vi_load(v1_vi_impl *vi_lib) {
     if (!(vi_lib->fnSetChannelConfig = (int(*)(int channel, v1_vi_chn *config))
         hal_symbol_load("v1_vi", vi_lib->handle, "HI_MPI_VI_SetChnAttr")))
         return EXIT_FAILURE;
+
+    // Optional: night grayscale via ISP saturation (majestic-style). Absent on
+    // some firmwares; v1_channel_grayscale() falls back to VENC color2grey.
+    vi_lib->fnGetCSCAttr = dlsym(vi_lib->handle, "HI_MPI_VI_GetCSCAttr");
+    vi_lib->fnSetCSCAttr = dlsym(vi_lib->handle, "HI_MPI_VI_SetCSCAttr");
 
     return EXIT_SUCCESS;
 }

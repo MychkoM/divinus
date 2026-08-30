@@ -72,11 +72,14 @@ int gpio_init(void) {
     return EXIT_SUCCESS;
 }
 
+// Pins configured as 999 mean 'not wired' and must never touch sysfs.
+#define GPIO_PIN_UNUSED(pin) ((pin) == 999)
+
 static inline int gpio_direction(char pin, char *mode) {
     char path[40];
     sprintf(path, "/sys/class/gpio/gpio%d/direction", pin);
     int fd = open(path, O_WRONLY);
-    if (!fd)
+    if (fd < 0)
         HAL_ERROR("gpio", "Unable to control the direction of GPIO pin %d!\n", pin);
     if (write(fd, mode, strlen(mode)) < 0) {
         close(fd);
@@ -91,14 +94,14 @@ static inline int gpio_export(char pin, bool create) {
     char path[40];
     int fd = open(create ? "/sys/class/gpio/export" :
        "/sys/class/gpio/unexport", O_WRONLY);
-    if (!fd)
+    if (fd < 0)
         HAL_ERROR("gpio", "Unable to (un)export a GPIO pin!\n");
 
     char val[4];
     sprintf(val, "%d", pin);
     if (write(fd, val, strlen(val)) < 0) {
         close(fd);
-        HAL_ERROR("gpio", "Unable to %s GPIO pin %d!\n", 
+        HAL_ERROR("gpio", "Unable to %s GPIO pin %d!\n",
             create ? "export" : "unexport", pin);
     }
 
@@ -106,41 +109,52 @@ static inline int gpio_export(char pin, bool create) {
     return EXIT_SUCCESS;
 }
 
+// Keep the pin exported for the whole lifetime: unexporting hands the pad
+// back to its muxed function (on hisi-gen1 GPIO0_4 is SENSOR_CLK!), which
+// glitches the IR-cut half-bridge in between the pulses. Export once, set
+// the direction, then only ever poke the value file.
+static inline int gpio_ensure(char pin, char *mode) {
+    char path[40];
+    sprintf(path, "/sys/class/gpio/gpio%d/value", pin);
+    if (access(path, F_OK)) {
+        if (gpio_export(pin, true)) return EXIT_FAILURE;
+        usleep(20000); // give sysfs a moment to spawn the node
+        if (access(path, F_OK))
+            HAL_ERROR("gpio", "GPIO pin %d did not appear after export!\n", pin);
+    }
+
+    return gpio_direction(pin, mode);
+}
+
 int gpio_read(char pin, bool *value) {
-    gpio_export(pin, true);
-    if (gpio_direction(pin, "in")) return EXIT_FAILURE;
+    if (GPIO_PIN_UNUSED(pin)) return EXIT_SUCCESS;
+    if (gpio_ensure(pin, "in")) return EXIT_FAILURE;
 
     char path[40];
     sprintf(path, "/sys/class/gpio/gpio%d/value", pin);
     int fd = open(path, O_RDONLY);
-    if (!fd)
-        HAL_ERROR("gpio", "Unable to read from GPIO pin %d!\n", pin);
+    if (fd < 0)
+        HAL_ERROR("gpio", "Unable to open GPIO pin %d for reading!\n", pin);
 
     char val = 0;
-    lseek(fd, 0, SEEK_SET);
-    read(fd, &val, 0);
-    if (!val) {
-        close(fd);
-        HAL_ERROR("gpio", "Unable to read from GPIO pin %d!\n", pin);
-    }
-    *value = val - 0x30;
+    ssize_t got = read(fd, &val, 1);
     close(fd);
+    if (got != 1 || (val != '0' && val != '1'))
+        HAL_ERROR("gpio", "Unable to read from GPIO pin %d!\n", pin);
 
-    if (gpio_direction(pin, "out")) return EXIT_FAILURE;
-    if (gpio_export(pin, false)) return EXIT_FAILURE;
-
+    *value = (val == '1');
     return EXIT_SUCCESS;
 }
 
 int gpio_write(char pin, bool value) {
-    gpio_export(pin, true);
-    if (gpio_direction(pin, "out")) return EXIT_FAILURE;
+    if (GPIO_PIN_UNUSED(pin)) return EXIT_SUCCESS;
+    if (gpio_ensure(pin, "out")) return EXIT_FAILURE;
 
     char path[40];
     sprintf(path, "/sys/class/gpio/gpio%d/value", pin);
     int fd = open(path, O_WRONLY);
-    if (!fd)
-        HAL_ERROR("gpio", "Unable to write to GPIO pin %d!\n", pin);
+    if (fd < 0)
+        HAL_ERROR("gpio", "Unable to open GPIO pin %d for writing!\n", pin);
 
     char val = value ? '1' : '0';
     if (write(fd, &val, 1) < 0) {
@@ -148,8 +162,6 @@ int gpio_write(char pin, bool value) {
         HAL_ERROR("gpio", "Unable to write to GPIO pin %d!\n", pin);
     }
     close(fd);
-
-    if (gpio_export(pin, false)) return EXIT_FAILURE;
 
     return EXIT_SUCCESS;
 }

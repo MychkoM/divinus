@@ -47,6 +47,9 @@ struct nal_rtp_t {
         unsigned char payload[__RTP_MAXPAYLOADSIZE];
     } packet;
     int    rtpsize;
+    // -1 = audio (never gated), 0 = inter frame, 1 = keyframe group member
+    // (IDR / parameter sets / SEI)
+    char   keyframe;
     struct list_t list_entry;
 };
 

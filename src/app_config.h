@@ -36,6 +36,14 @@ struct AppConfig {
     unsigned int pin_switch_delay_us;
     char adc_device[128];
     int adc_threshold;
+    /* [divinus-142] day/night automation */
+    char night_mode_cfg[12];      /* "" = legacy, auto | manual | day | night */
+    char light_source[12];        /* gpio (legacy pin) | sensor (SC1035 AE) */
+    int dark_gain_tier;
+    int dark_exposure_min;
+    int bright_gain_tier;
+    int bright_exposure_max;
+    int switch_hold_s;
 
     // [isp]
     bool mirror;

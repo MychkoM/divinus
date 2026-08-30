@@ -1,6 +1,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <netdb.h>
 #include <errno.h>
@@ -18,6 +19,8 @@
 #include "rtcp.h"
 #include "bufpool.h"
 #include "mime.h"
+
+extern void request_idr(void);
 
 /******************************************************************************
  *              PRIVATE DEFINITIONS
@@ -77,6 +80,19 @@ static int __tcp_flush_each(struct list_t *e, void *v)
  *              PRIVATE FUNCTIONS
  ******************************************************************************/
 
+/* [divinus-142] RFC 6184: every packet of an access unit MUST share one RTP
+ * timestamp. Stamp it once per AU from a monotonic 90 kHz clock. The old code
+ * re-stamped it on the marker packet mid-AU, so the tail fragment of a frame
+ * carried a fresh ts while its fragments (and preceding SPS/PPS/AUD) carried
+ * the previous one -> players saw non-monotonic dts ("skips"). */
+static inline unsigned int __au_ts(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (unsigned int)(((unsigned long long)ts.tv_sec * 1000ULL +
+        (unsigned long long)(ts.tv_nsec / 1000000)) * 90ULL);
+}
+
 static inline int __transfer_nal_h26x(struct list_head_t *trans_list, unsigned char *nalptr, size_t nalsize, char isH265)
 {
     struct nal_rtp_t rtp;
@@ -87,6 +103,9 @@ static inline int __transfer_nal_h26x(struct list_head_t *trans_list, unsigned c
 
     rtp_hdr_t *p_header = &(rtp.packet.header);
     unsigned char *payload = rtp.packet.payload;
+
+    rtp.keyframe = (!isH265 && (pt == 5  || pt == 6  || pt == 7  || pt == 8)) ||
+                   ( isH265 && (pt == 19 || pt == 20 || pt == 32 || pt == 33 || pt == 34));
 
     p_header->version = 2;
     p_header->p = 0;
@@ -172,6 +191,8 @@ static inline int __transfer_nal_mpga(struct list_head_t *trans_list, unsigned c
     rtp_hdr_t *p_header = &(rtp.packet.header);
     unsigned char *payload = rtp.packet.payload;
 
+    rtp.keyframe = -1; /* audio: never gated by keyframe logic */
+
     p_header->version = 2;
     p_header->p = 0;
     p_header->x = 0;
@@ -223,6 +244,15 @@ static inline int __rtp_send_eachconnection(struct list_t *e, void *v)
     MUST(con = trans->con, return FAILURE);
     if (!con->trans[track_id].server_port_rtp && !con->trans[track_id].is_tcp) return SUCCESS;
 
+    /* keyframe gate: after a send-budget stall the chain of references for
+     * this client is broken — sending P-frames only produces a frozen/garbled
+     * picture. Drop everything until the next IDR arrives, and ask the
+     * encoder for one immediately so recovery takes <1 GOP. */
+    if (rtp->keyframe == 1)
+        con->trans[track_id].drop_until_key = 0;
+    else if (rtp->keyframe >= 0 && con->trans[track_id].drop_until_key)
+        return SUCCESS;
+
     rtp->packet.header.seq = htons(con->trans[track_id].rtp_seq);
     con->trans[track_id].rtp_timestamp = track_id ? __frame_ts_audio : __frame_ts_video;
     rtp->packet.header.ts = htonl(con->trans[track_id].rtp_timestamp);
@@ -235,6 +265,11 @@ static inline int __rtp_send_eachconnection(struct list_t *e, void *v)
         head[1] = con->trans[track_id].channel_rtp;
         head[2] = (rtp->rtpsize >> 8) & 0xFF;
         head[3] = rtp->rtpsize & 0xFF;
+
+        /* Send with a bounded budget: a stalled TCP client must not block
+         * the video thread forever (it holds the VENC stream buffer). */
+        const unsigned int send_budget_ms = 100;
+        unsigned int spent_us = 0;
 
         pthread_mutex_lock(&con->write_mutex);
         if (con->tx_buf) {
@@ -281,6 +316,24 @@ static inline int __rtp_send_eachconnection(struct list_t *e, void *v)
             con->trans[track_id].rtcp_octet += rtp->rtpsize;
             return SUCCESS;
         }
+        /* Send budget exhausted (slow/stalled peer). Mark this connection:
+         * dropping whole frames until the next IDR is strictly better than
+         * emitting half-frames — a broken P-chain freezes the picture on the
+         * client (VLC shows a still image while the session looks healthy).
+         * Ask the encoder for an instant IDR (rate-limited to ~1/sec across
+         * all clients) so recovery is immediate when the stall clears.
+         * Do NOT touch the socket or bufpool here: teardown is owned by the
+         * RTSP thread (double-detach race, see commit history). */
+        if (!con->trans[track_id].drop_until_key)
+            ERR("CON %s: send stall -> drop-until-IDR\n", inet_ntoa(con->addr.sin_addr));
+        con->trans[track_id].drop_until_key = 1;
+        static time_t last_idr_req = 0;
+        time_t now = time(NULL);
+        if (now != last_idr_req) {
+            last_idr_req = now;
+            request_idr();
+        }
+        return SUCCESS;
     } else {
         char attempts = 0;
         do  {
@@ -315,7 +368,6 @@ static inline int __rtp_setup_transfer(struct list_t *e, void *v)
     struct connection_item_t *con;
     struct __transfer_set_t *trans_set = v;
     struct transfer_item_t *trans;
-    unsigned int timestamp_offset;
     int ret = FAILURE;
 
     list_upcast(con,e);
@@ -337,10 +389,9 @@ static inline int __rtp_setup_transfer(struct list_t *e, void *v)
         MUST(list_push(&trans_set->list_head, &trans->list_entry) == SUCCESS,
             goto error);
 
-        timestamp_offset = trans_set->h->stat.ts_offset;
-
-        con->trans[trans_set->track_id].rtp_timestamp = 
-            ((unsigned int)con->trans[trans_set->track_id].rtp_timestamp + timestamp_offset);
+        /* [divinus-142] one RTP timestamp per access unit, identical for
+         * every packet of this AU (was: per-marker restamp + ts_offset drift) */
+        con->trans[trans_set->track_id].rtp_timestamp = trans_set->au_ts;
     }
 
     ret = SUCCESS;
@@ -512,6 +563,7 @@ int rtp_send_h26x(rtsp_handle h, hal_vidstream *stream, char isH265)
 
     trans.h = h;
     trans.track_id = track_id;
+    trans.au_ts = __au_ts();
 
     /* setup transmission object */
     rtsp_lock(h);
@@ -612,6 +664,7 @@ int rtp_send_mp3(rtsp_handle h, unsigned char *buf, size_t len)
 
     trans.h = h;
     trans.track_id = track_id;
+    trans.au_ts = __au_ts();
 
     /* setup transmission object */
     rtsp_lock(h);

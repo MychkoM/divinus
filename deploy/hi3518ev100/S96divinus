@@ -1,0 +1,48 @@
+#!/bin/sh
+[ -r /etc/TZ ] && export TZ=$(cat /etc/TZ)
+WD=/opt/divinus/wd.sh
+reset_sensor() {
+    [ -x /usr/bin/devmem ] || return 0
+    devmem 0x200f0124 32 0x0
+    devmem 0x20140400 32 0x22
+    devmem 0x20140008 32 0x2
+    usleep 100000
+    devmem 0x20140008 32 0x0
+    usleep 100000
+    devmem 0x20140008 32 0x2
+}
+start() {
+    echo -n "Starting divinus: "
+    if pidof divinus >/dev/null; then echo "OK (already running)"; return 0; fi
+    reset_sensor
+    # wd.sh (respawn) ОТКЛЮЧЕН по запросу: видим реальные падения divinus без авто-рестарта.
+    # setsid sh -c "exec sh $WD" >/dev/null 2>&1 </dev/null &
+    cd /opt/divinus && setsid sh -c "./divinus > /tmp/divinus.log 2>&1" </dev/null &
+    echo $! > /var/run/divinus_wd.pid
+    echo "OK"
+}
+stop() {
+    echo -n "Stopping divinus: "
+    # busybox has no pkill: kill by pidfile first
+    [ -f /var/run/divinus_wd.pid ] && kill $(cat /var/run/divinus_wd.pid) 2>/dev/null
+    # ps-scan wd.sh ЗАКОММЕНТИРОВАН: wd отключён, а паттерн убивал ssh-шелл вызывающей команды
+    # for wdp in $(ps | grep "[w]d\.sh" | awk '{print $1}'); do kill $wdp 2>/dev/null; done
+    kill $(pidof divinus) 2>/dev/null
+    sleep 1
+    kill -9 $(pidof divinus) 2>/dev/null
+    pidof divinus >/dev/null && { echo FAIL; return 1; } || { rm -f /var/run/divinus_wd.pid; echo OK; }
+}
+reload() {
+    # ВНИМАНИЕ: SIGHUP в divinus = handle_exit (graceful shutdown, main.c:46-47),
+    # НЕ перечитка конфига! Поэтому reload = честный restart (стоп + старт).
+    stop
+    sleep 1
+    start
+}
+case "$1" in
+    start) start ;;
+    stop)  stop ;;
+    reload) reload ;;
+    restart) stop; sleep 2; start ;;
+    *) echo "Usage: $0 {start|stop|restart|reload}"; exit 1 ;;
+esac

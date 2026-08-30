@@ -1324,6 +1324,32 @@ void respond_request(http_request_t *req) {
                     short result = strtol(value, &remain, 10);
                     if (remain != value)
                         app_config.ir_sensor_pin = result;
+                } else if (EQUALS(key, "mode")) {
+                    strncpy(app_config.night_mode_cfg, value,
+                        sizeof(app_config.night_mode_cfg) - 1);
+                } else if (EQUALS(key, "light_source")) {
+                    strncpy(app_config.light_source, value,
+                        sizeof(app_config.light_source) - 1);
+                } else if (EQUALS(key, "dark_gain_tier")) {
+                    short result = strtol(value, &remain, 10);
+                    if (remain != value)
+                        app_config.dark_gain_tier = result;
+                } else if (EQUALS(key, "dark_exposure_min")) {
+                    short result = strtol(value, &remain, 10);
+                    if (remain != value)
+                        app_config.dark_exposure_min = result;
+                } else if (EQUALS(key, "bright_gain_tier")) {
+                    short result = strtol(value, &remain, 10);
+                    if (remain != value)
+                        app_config.bright_gain_tier = result;
+                } else if (EQUALS(key, "bright_exposure_max")) {
+                    short result = strtol(value, &remain, 10);
+                    if (remain != value)
+                        app_config.bright_exposure_max = result;
+                } else if (EQUALS(key, "switch_hold_s")) {
+                    short result = strtol(value, &remain, 10);
+                    if (remain != value)
+                        app_config.switch_hold_s = result;
                 } else if (EQUALS(key, "manual")) {
                     if (EQUALS_CASE(value, "true") || EQUALS(value, "1"))
                         night_manual(1);
@@ -1335,18 +1361,23 @@ void respond_request(http_request_t *req) {
             night_disable();
             if (app_config.night_mode_enable) night_enable();
         }
+        int nl_lines = 0, nl_tier = 0, nl_dark = -1;
+        night_light_last(&nl_lines, &nl_tier, &nl_dark);
         respLen = sprintf(response,
             "HTTP/1.1 200 OK\r\n"
             "Content-Type: application/json;charset=UTF-8\r\n"
             "Connection: close\r\n"
             "\r\n"
             "{\"active\":%s,\"manual\":%s,\"grayscale\":%s,\"ircut\":%s,\"ircut_pin1\":%d,\"ircut_pin2\":%d,"
-            "\"irled\":%s,\"irled_pin\":%d,\"irsense_pin\":%d,\"adc_device\":\"%s\",\"adc_threshold\":%d}",
+            "\"irled\":%s,\"irled_pin\":%d,\"irsense_pin\":%d,\"adc_device\":\"%s\",\"adc_threshold\":%d,"
+            "\"mode\":\"%s\",\"light_source\":\"%s\",\"exp\":%d,\"tier\":%d,\"dark\":%d,\"switch_hold_s\":%d}",
             app_config.night_mode_enable ? "true" : "false", night_manual_on() ? "true" : "false",
             night_grayscale_on() ? "true" : "false",
             night_ircut_on() ? "true" : "false", app_config.ir_cut_pin1, app_config.ir_cut_pin2,
             night_irled_on() ? "true" : "false", app_config.ir_led_pin, app_config.ir_sensor_pin,
-            app_config.adc_device, app_config.adc_threshold);
+            app_config.adc_device, app_config.adc_threshold,
+            app_config.night_mode_cfg, app_config.light_source,
+            nl_lines, nl_tier, nl_dark, app_config.switch_hold_s);
         send_and_close(req->clntFd, response, respLen);
         return;
     }

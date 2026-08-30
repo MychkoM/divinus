@@ -29,6 +29,9 @@ char _v1_vi_dev = 0;
 char _v1_vpss_chn = 0;
 char _v1_vpss_grp = 0;
 
+/* AE/VTS i2c state dump for stalls (hi_i2c VTS hardening, see quirks.c) */
+extern void vts_quirk_dump(void);
+
 void v1_hal_deinit(void)
 {
     v1_vpss_unload(&v1_vpss);
@@ -183,13 +186,50 @@ int v1_channel_create(char index, short width, short height, char mirror, char f
 
 int v1_channel_grayscale(char enable)
 {
+    // Preferred path (proven stable on this SoC): ISP-side desaturation via
+    // HI_MPI_VI_SetCSCAttr(u32SatuVal = 0/50). Touches only the color-space
+    // converter, UAVG lands exactly on 128.0 and the encoder is never asked
+    // to change GOP mode mid-stream, so the VEDU wedge (vedu watchdog here)
+    // cannot happen. VENC color2grey is kept as fallback for firmwares whose
+    // libmpi lacks the VI CSC symbols.
+    if (v1_vi.fnSetCSCAttr && v1_vi.fnGetCSCAttr)
+    {
+        v1_vi_csc csc;
+        int ret = v1_vi.fnGetCSCAttr(_v1_vi_dev, &csc);
+        if (ret)
+            HAL_WARNING("v1_vi", "GetCSCAttr failed with %#x, falling back to VENC\n", ret);
+        else
+        {
+            csc.satu = enable ? 0 : 50;
+            ret = v1_vi.fnSetCSCAttr(_v1_vi_dev, &csc);
+            if (!ret)
+            {
+                HAL_INFO("v1_vi", "Grayscale %s via VI CSC (saturation=%u)\n",
+                         enable ? "ON" : "OFF", csc.satu);
+                return EXIT_SUCCESS;
+            }
+            HAL_WARNING("v1_vi", "SetCSCAttr failed with %#x, falling back to VENC\n", ret);
+        }
+    }
+
     int ret;
     int active = enable;
 
     for (char i = 0; i < V1_VENC_CHN_NUM; i++)
         if (v1_state[i].enable)
             if (ret = v1_venc.fnSetColorToGray(i, &active))
+            {
+                HAL_WARNING("v1_venc", "SetGrpColor2Grey(%d,%d) failed with %#x\n", i, active, ret);
                 return ret;
+            }
+            else
+                // Toggling color2grey mid-GOP leaves VEDU encoder state
+                // inconsistent (inter frames referencing frames encoded in the
+                // other mode); it intermittently wedges the whole channel
+                // (vedu "watchdog here" in dmesg, stream loop timed out, only
+                // reboot recovers). Forcing an instant IDR closes the GOP at
+                // the switch point.
+                v1_venc.fnRequestIdr(i, 1);
 
     return EXIT_SUCCESS;
 }
@@ -442,88 +482,105 @@ int v1_video_create(char index, hal_vidconfig *config)
     int ret;
     v1_venc_chn channel;
     v1_venc_attr_h264 *attrib;
+
+    // HI_MPI_VENC_CreateGroup on hi3518ev100 (MPP V1.0.B.0) clobbers the
+    // callee-saved register holding `config` (observed: valid pointer before
+    // the call, NULL right after). Copy every field we need up front so the
+    // SDK calls below never dereference the original pointer again.
+    hal_vidconfig cfg = *config;
+
     memset(&channel, 0, sizeof(channel));
 
-    if (config->codec == HAL_VIDCODEC_JPG) {
+    if (cfg.codec == HAL_VIDCODEC_JPG) {
         channel.attrib.codec = V1_VENC_CODEC_JPEG;
-        channel.attrib.jpg.maxPic.width = config->width;
-        channel.attrib.jpg.maxPic.height = config->height;
+        channel.attrib.jpg.maxPic.width = cfg.width;
+        channel.attrib.jpg.maxPic.height = cfg.height;
         channel.attrib.jpg.bufSize =
-            ALIGN_UP(config->height, 16) * ALIGN_UP(config->width, 16);
+            ALIGN_UP(cfg.height, 16) * ALIGN_UP(cfg.width, 16);
         channel.attrib.jpg.byFrame = 0;
         channel.attrib.jpg.fieldOrFrame = 0;
         channel.attrib.jpg.priority = 0;
-        channel.attrib.jpg.pic.width = config->width;
-        channel.attrib.jpg.pic.height = config->height;
+        channel.attrib.jpg.pic.width = cfg.width;
+        channel.attrib.jpg.pic.height = cfg.height;
         goto attach;
-    } else if (config->codec == HAL_VIDCODEC_MJPG) {
+    } else if (cfg.codec == HAL_VIDCODEC_MJPG) {
         channel.attrib.codec = V1_VENC_CODEC_MJPG;
-        channel.attrib.mjpg.maxPic.width = config->width;
-        channel.attrib.mjpg.maxPic.height = config->height;
+        channel.attrib.mjpg.maxPic.width = cfg.width;
+        channel.attrib.mjpg.maxPic.height = cfg.height;
         channel.attrib.mjpg.bufSize =
-            ALIGN_UP(config->height, 16) * ALIGN_UP(config->width, 16);
+            ALIGN_UP(cfg.height, 16) * ALIGN_UP(cfg.width, 16);
         channel.attrib.mjpg.byFrame = 0;
         channel.attrib.mjpg.mainStrmOn = 1;
         channel.attrib.mjpg.fieldOrFrame = 0;
         channel.attrib.mjpg.priority = 0;
-        channel.attrib.mjpg.pic.width = config->width;
-        channel.attrib.mjpg.pic.height = config->height;
-        switch (config->mode) {
+        channel.attrib.mjpg.pic.width = cfg.width;
+        channel.attrib.mjpg.pic.height = cfg.height;
+        switch (cfg.mode) {
             case HAL_VIDMODE_CBR:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGCBR;
-                channel.rate.mjpgCbr = (v1_venc_rate_mjpgcbr){ .statTime = 1, .srcFps = config->framerate,
-                    .dstFps = config->framerate, .bitrate = config->bitrate, .avgLvl = 0 }; break;
+                channel.rate.mjpgCbr = (v1_venc_rate_mjpgcbr){ .statTime = 1, .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate, .bitrate = cfg.bitrate, .avgLvl = 0 }; break;
             case HAL_VIDMODE_VBR:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGVBR;
-                channel.rate.mjpgVbr = (v1_venc_rate_mjpgvbr){ .statTime = 1, .srcFps = config->framerate,
-                    .dstFps = config->framerate , .maxBitrate = MAX(config->bitrate, config->maxBitrate),
-                    .maxQual = config->maxQual, .minQual = config->maxQual }; break;
+                channel.rate.mjpgVbr = (v1_venc_rate_mjpgvbr){ .statTime = 1, .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate , .maxBitrate = MAX(cfg.bitrate, cfg.maxBitrate),
+                    .maxQual = cfg.maxQual, .minQual = cfg.maxQual }; break;
             case HAL_VIDMODE_QP:
                 channel.rate.mode = V1_VENC_RATEMODE_MJPGQP;
-                channel.rate.mjpgQp = (v1_venc_rate_mjpgqp){ .srcFps = config->framerate,
-                    .dstFps = config->framerate, .quality = config->maxQual }; break;
+                channel.rate.mjpgQp = (v1_venc_rate_mjpgqp){ .srcFps = cfg.framerate,
+                    .dstFps = cfg.framerate, .quality = cfg.maxQual }; break;
             default:
                 HAL_ERROR("v1_venc", "MJPEG encoder can only support CBR, VBR or fixed QP modes!");
         }
         goto attach;
-    } else if (config->codec == HAL_VIDCODEC_H264) {
+    } else if (cfg.codec == HAL_VIDCODEC_H264) {
         channel.attrib.codec = V1_VENC_CODEC_H264;
         attrib = &channel.attrib.h264;
-        switch (config->mode) {
+        switch (cfg.mode) {
             case HAL_VIDMODE_CBR:
                 channel.rate.mode = V1_VENC_RATEMODE_H264CBRv2;
-                channel.rate.h264Cbr = (v1_venc_rate_h264cbr){ .gop = config->gop,
-                    .statTime = 1, .srcFps = config->framerate, .dstFps = config->framerate,
-                    .bitrate = config->bitrate, .avgLvl = 0 }; break;
+                channel.rate.h264Cbr = (v1_venc_rate_h264cbr){ .gop = cfg.gop,
+                    .statTime = 1, .srcFps = cfg.framerate, .dstFps = cfg.framerate,
+                    .bitrate = cfg.bitrate, .avgLvl = 0 }; break;
             case HAL_VIDMODE_VBR:
                 channel.rate.mode = V1_VENC_RATEMODE_H264VBRv2;
-                channel.rate.h264Vbr = (v1_venc_rate_h264vbr){ .gop = config->gop,
-                    .statTime = 1, .srcFps = config->framerate, .dstFps = config->framerate,
-                    .maxBitrate = MAX(config->bitrate, config->maxBitrate), .maxQual = config->maxQual,
-                    .minQual = config->minQual }; break;
+                channel.rate.h264Vbr = (v1_venc_rate_h264vbr){ .gop = cfg.gop,
+                    .statTime = 1, .srcFps = cfg.framerate, .dstFps = cfg.framerate,
+                    .maxBitrate = MAX(cfg.bitrate, cfg.maxBitrate), .maxQual = cfg.maxQual,
+                    .minQual = cfg.minQual }; break;
             case HAL_VIDMODE_QP:
                 channel.rate.mode = V1_VENC_RATEMODE_H264QP;
-                channel.rate.h264Qp = (v1_venc_rate_h264qp){ .gop = config->gop,
-                    .srcFps = config->framerate, .dstFps = config->framerate, .interQual = config->maxQual,
-                    .predQual = config->minQual }; break;
+                channel.rate.h264Qp = (v1_venc_rate_h264qp){ .gop = cfg.gop,
+                    .srcFps = cfg.framerate, .dstFps = cfg.framerate, .interQual = cfg.maxQual,
+                    .predQual = cfg.minQual }; break;
             default:
                 HAL_ERROR("v1_venc", "H.264 encoder does not support this mode!");
         }
     } else HAL_ERROR("v1_venc", "This codec is not supported by the hardware!");
-    attrib->maxPic.width = config->width;
-    attrib->maxPic.height = config->height;
-    attrib->bufSize = config->width * config->height;
-    attrib->profile = MIN(config->profile, 1);
+    attrib->maxPic.width = cfg.width;
+    attrib->maxPic.height = cfg.height;
+    attrib->bufSize = cfg.width * cfg.height;
+    attrib->profile = MIN(cfg.profile, 1);
     attrib->byFrame = 0;
     attrib->fieldOn = 0;
     attrib->mainStrmOn = 1;
     attrib->priority = 0;
     attrib->fieldOrFrame = 0;
-    attrib->pic.width = config->width;
-    attrib->pic.height = config->height;
+    attrib->pic.width = cfg.width;
+    attrib->pic.height = cfg.height;
 attach:
     if (ret = v1_venc.fnCreateGroup(index))
         return ret;
+
+    {
+        // MPP V1.0.B.0: SetGrpColor2Grey needs the group buffer armed first
+        // (balloc happens inside SetColor2GreyConf); doing it at creation time
+        // avoids the kernel-side reject of a runtime arming attempt.
+        struct { int enable; unsigned int width; unsigned int height; } conf =
+            { .enable = 1, .width = cfg.width, .height = cfg.height };
+        if (ret = v1_venc.fnSetColorToGrayConf(&conf))
+            HAL_WARNING("v1_venc", "Color2GreyConf arm failed with %#x\n", ret);
+    }
 
     if (ret = v1_venc.fnCreateChannel(index, &channel))
         return ret;
@@ -531,11 +588,11 @@ attach:
     if (ret = v1_venc.fnRegisterChannel(index, index))
         return ret;
 
-    if (config->codec != HAL_VIDCODEC_JPG &&
+    if (cfg.codec != HAL_VIDCODEC_JPG &&
         (ret = v1_venc.fnStartReceiving(index)))
         return ret;
 
-    v1_state[index].payload = config->codec;
+    v1_state[index].payload = cfg.codec;
 
     return EXIT_SUCCESS;
 }
@@ -689,6 +746,7 @@ abort:
 void *v1_video_thread(void)
 {
     int ret, maxFd = 0;
+    int stallTicks = 0;  // consecutive empty-select rounds (2026-09-28)
 
     for (int i = 0; i < V1_VENC_CHN_NUM; i++) {
         if (!v1_state[i].enable) continue;
@@ -726,8 +784,22 @@ void *v1_video_thread(void)
             break;
         } else if (ret == 0) {
             HAL_WARNING("v1_venc", "Main stream loop timed out!\n");
+            // 2026-09-28: sensor/VI can stop delivering frames forever (caught:
+            // VI IntCnt frozen 20h, SC1035 stall). No in-process recovery helps,
+            // but a full process restart re-inits MPP + sensor and works
+            // (proven: kill->respawn restored fps every time). 10 rounds x 2s
+            // select timeout = 20s max visible stall, then wd.sh respawns us.
+            if (stallTicks == 5) vts_quirk_dump();  /* AE/VTS i2c state = evidence */
+            if (++stallTicks >= 10) {
+                /* NOT HAL_ERROR: its body ends in `return EXIT_FAILURE`, which would
+                 * only kill THIS thread and leave the process serving no frames.
+                 * We must exit() so wd.sh re-inits the whole pipeline. */
+                fprintf(stderr, "[v1_venc] No frames for 20s, exiting -> wd.sh respawn\n");
+                exit(1);
+            }
             continue;
         } else {
+            stallTicks = 0;
             for (int i = 0; i < V1_VENC_CHN_NUM; i++) {
                 if (!v1_state[i].enable) continue;
                 if (!v1_state[i].mainLoop) continue;
@@ -757,22 +829,43 @@ void *v1_video_thread(void)
                     }
                     stream.count = stat.curPacks;
 
-                    if (ret = v1_venc.fnGetStream(i, &stream, 40)) {
+                    if (ret = v1_venc.fnGetStream(i, &stream, 1)) {
                         HAL_DANGER("v1_venc", "Getting the stream on "
                             "channel %d failed with %#x!\n", i, ret);
                         if (stat.curPacks > 8) free(stream.packet);
                         break;
                     }
 
-                    if (v1_vid_cb) {
-                        hal_vidstream outStrm;
-                        hal_vidpack outPack[stream.count];
+                    /* Copy the frame out of the VENC stream buffer, release the
+                     * buffer, and only then hand the frame over to consumers
+                     * (RTSP/HTTP). Never hold the encoder stream buffer
+                     * across network I/O. */
+                    unsigned char *frameBuf = NULL;
+                    unsigned int frameLen = 0;
+                    for (int j = 0; j < stream.count; j++)
+                        frameLen += stream.packet[j].length[0] + stream.packet[j].length[1];
+                    if (v1_vid_cb && frameLen) {
+                        frameBuf = malloc(frameLen);
+                        if (!frameBuf)
+                            HAL_WARNING("v1_venc", "Frame copy of %u bytes failed, dropping frame!\n", frameLen);
+                    }
+
+                    hal_vidstream outStrm;
+                    hal_vidpack outPack[stream.count];
+                    if (frameBuf) {
                         outStrm.count = stream.count;
                         outStrm.seq = stream.sequence;
+                        unsigned int copied = 0;
                         for (int j = 0; j < stream.count; j++) {
                             v1_venc_pack *pack = &stream.packet[j];
-                            outPack[j].data = pack->data[0];
+                            outPack[j].data = frameBuf + copied;
                             outPack[j].length = pack->length[0] + pack->length[1];
+                            memcpy(frameBuf + copied, pack->data[0], pack->length[0]);
+                            copied += pack->length[0];
+                            if (pack->length[1]) {
+                                memcpy(frameBuf + copied, pack->data[1], pack->length[1]);
+                                copied += pack->length[1];
+                            }
                             outPack[j].naluCnt = 1;
                             outPack[j].nalu[0].length = pack->length[0] + pack->length[1];
                             outPack[j].nalu[0].offset = pack->offset;
@@ -785,7 +878,6 @@ void *v1_video_thread(void)
                             outPack[j].timestamp = pack->timestamp;
                         }
                         outStrm.pack = outPack;
-                        (*v1_vid_cb)(i, &outStrm);
                     }
 
                     if (ret = v1_venc.fnFreeStream(i, &stream)) {
@@ -793,6 +885,11 @@ void *v1_video_thread(void)
                             "channel %d failed with %#x!\n", i, ret);
                     }
                     if (stat.curPacks > 8) free(stream.packet);
+
+                    if (frameBuf) {
+                        (*v1_vid_cb)(i, &outStrm);
+                        free(frameBuf);
+                    }
                 }
             }
         }

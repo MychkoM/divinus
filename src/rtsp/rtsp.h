@@ -91,17 +91,29 @@ typedef struct {
     unsigned short rtp_seq;
     unsigned int rtp_timestamp;
     char is_tcp;
+    // Send budget was exhausted: subsequent P-frames would be undecodable
+    // half-frames for this client (frozen picture in VLC). Skip sending until
+    // the next IDR restores a clean reference chain.
+    char drop_until_key;
     unsigned char channel_rtp;
     unsigned char channel_rtcp;
 } transport_t;
 
 struct connection_item_t {
     struct sockaddr_in addr;
-    FILE *fp_tcp_read;
     FILE *fp_tcp_write;
     int client_fd;
     int track_id;
     int cseq;
+    const char *close_reason;
+    // Persistent receive buffering: stdio on a nonblocking socket turns EAGAIN
+    // into false EOF and drops partially-read bytes, which killed sessions on
+    // Wi-Fi-segmented keepalives. Raw recv into rxbuf, requests are assembled
+    // from complete lines — nothing is ever lost, nothing misread as EOF.
+    char rxbuf[3072];
+    unsigned int rxlen;
+    char reqbuf[2048];
+    unsigned int reqlen;
 
     transport_t trans[2];
 
@@ -164,7 +176,7 @@ struct sock_select_t {
  ******************************************************************************/
 static inline void rtsp_lock(rtsp_handle h);
 static inline void rtsp_unlock(rtsp_handle h);
-static inline int __read_line(struct connection_item_t *p, char *buf);
+static inline int __next_line(char *reqbuf, unsigned int *reqlen, char *line, unsigned int max);
 static inline int __transfer_item_cleaner(struct list_t *e);
 
 /******************************************************************************
@@ -180,29 +192,24 @@ static inline void rtsp_unlock(rtsp_handle h)
     pthread_mutex_unlock(&h->mutex);
 }
 
-static inline int __read_line(struct connection_item_t *p, char *buf)
+// returns: 1 = line parsed, 0 = terminator (__TERM) consumed, -1 = incomplete
+static inline int __next_line(char *reqbuf, unsigned int *reqlen, char *line, unsigned int max)
 {
-    /* we set the socket to non-blocking */
-    if (fgets(buf, __RTSP_TCP_BUF_SIZE, p->fp_tcp_read) == NULL)
-	{
-        /* unexpected end. we do not expect it */
-        if (p->parser_state == __PARSER_S_INIT) {
-            /* when this selected sd is EOF at first glance, it's dead */
-            DBG("disconnected\n");
-        } else {
-            /* corrupted message. nothing to be done */
-            ERR("message end before delimiter\n");
-        }
+    if (*reqlen == 0) return -1;
 
-        p->con_state = __CON_S_DISCONNECTED;
-        ASSERT(bufpool_detach(p->pool, p) == SUCCESS, ERR("connection detach failed\n"));
-        return FALSE;
-    }
+    char *nl = memchr(reqbuf, '\n', *reqlen);
+    if (!nl) return -1;
 
-    DBG(">%s", buf);
+    unsigned int line_len = (unsigned int)(nl - reqbuf) + 1;
+    if (line_len >= max) line_len = max - 1;
+    memcpy(line, reqbuf, line_len);
+    line[line_len] = 0;
+    memmove(reqbuf, reqbuf + line_len, *reqlen - line_len);
+    *reqlen -= line_len;
 
-    /* check end of request */
-    return !(SCMP(__TERM, buf));
+    if (line[0] == '\r' && line[1] == '\n')
+        return 0;
+    return 1;
 }
 
 static inline unsigned long long __get_random_byte(unsigned *ctx)

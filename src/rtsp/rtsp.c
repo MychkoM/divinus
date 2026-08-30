@@ -35,6 +35,8 @@ extern void request_idr();
 #define __STR_CLIENTPORT  "client_port"
 #define __STR_INTERLEAVED "interleaved"
 #define __STR_RTP_AVP_TCP "RTP/AVP/TCP"
+#define __STR_GET  "GET"
+#define __STR_SET  "SET"
 #define __STR_SESSION  "SESSION"
 #define __STR_PAUSE "PAUSE"
 #define __STR_RECORDING "RECORDING"
@@ -381,26 +383,80 @@ static int __message_proc_sock(struct list_t *e, void *p)
     }
 
     if (FD_ISSET(con->client_fd, &(socks->rfds))) {
-        int first_char = fgetc(con->fp_tcp_read);
-        if (first_char == '$') {
-            unsigned char head[3];
-            if (fread(head, 1, 3, con->fp_tcp_read) == 3) {
-                int len = (head[1] << 8) | head[2];
-                while (len > 0) {
-                    int r = fread(buf, 1, min(len, sizeof(buf)), con->fp_tcp_read);
-                    if (r <= 0) break;
-                    len -= r;
-                }
-                DBG("discarded interleaved packet (%d bytes)\n", (head[1] << 8) | head[2]);
+        /* Drain the socket into the persistent buffer (nonblocking raw recv;
+         * stdio would turn EAGAIN into false EOF and lose partial bytes). */
+        for (;;) {
+            if (con->reqlen >= sizeof(con->reqbuf)) {
+                con->close_reason = "request overflow";
+                con->con_state = __CON_S_DISCONNECTED;
+                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
+                return SUCCESS;
             }
-            return SUCCESS;
-        } else if (first_char != EOF) {
-            ungetc(first_char, con->fp_tcp_read);
-        } else {
+
+            int r = recv(con->client_fd, con->rxbuf,
+                min((size_t)sizeof(con->rxbuf), sizeof(con->reqbuf) - con->reqlen), 0);
+            if (r > 0) {
+                memcpy(con->reqbuf + con->reqlen, con->rxbuf, r);
+                con->reqlen += r;
+                continue;
+            }
+            if (r == 0) {
+                con->close_reason = "client closed (EOF)";
+                con->con_state = __CON_S_DISCONNECTED;
+                ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
+                return SUCCESS;
+            }
+            if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+                break;
+            con->close_reason = "socket error";
+            ERR("recv errno=%d (%s) fd=%d reqlen=%u\n", errno, strerror(errno),
+                con->client_fd, con->reqlen);
             con->con_state = __CON_S_DISCONNECTED;
             ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
             return SUCCESS;
         }
+    }
+
+    /* Serve complete units from the persistent buffer: interleaved (RTCP)
+     * packets and whole RTSP requests (terminated by an empty line).
+     * Anything incomplete simply waits for the next readable event — no
+     * bytes are ever dropped or misread. */
+    for (;;) {
+        if (con->reqlen == 0)
+            return SUCCESS;
+
+        if (con->reqbuf[0] == '$') {
+            if (con->reqlen < 4)
+                return SUCCESS;
+            unsigned int plen = (((unsigned char)con->reqbuf[2]) << 8) |
+                                 (unsigned char)con->reqbuf[3];
+            if (con->reqlen < 4 + plen)
+                return SUCCESS;
+            DBG("discarded interleaved packet (%u bytes)\n", plen);
+            memmove(con->reqbuf, con->reqbuf + 4 + plen, con->reqlen - 4 - plen);
+            con->reqlen -= 4 + plen;
+            continue;
+        }
+
+        unsigned int msglen = 0;
+        {
+            unsigned int i;
+            for (i = 0; i + 3 < con->reqlen; i++) {
+                if (con->reqbuf[i] == '\r' && con->reqbuf[i+1] == '\n' &&
+                    con->reqbuf[i+2] == '\r' && con->reqbuf[i+3] == '\n') {
+                    msglen = i + 4;
+                    break;
+                }
+            }
+        }
+        if (msglen == 0)
+            return SUCCESS; /* request still incomplete; keep it buffered */
+
+        char msg[sizeof(con->reqbuf) + 1];
+        memcpy(msg, con->reqbuf, msglen);
+        msg[msglen] = 0;
+        memmove(con->reqbuf, con->reqbuf + msglen, con->reqlen - msglen);
+        con->reqlen -= msglen;
 
         con->parser_state = __PARSER_S_INIT;
         con->method = __METHOD_NONE;
@@ -408,7 +464,9 @@ static int __message_proc_sock(struct list_t *e, void *p)
         char header = 0, isAuthValid = 0, *tok, *last;
         unsigned long long session_id;
         /* parse line by line. hereafter parser is switched according to the finite state machine */
-        while (__read_line(con, buf)) {
+        unsigned int mlen = msglen;
+        int lr;
+        while ((lr = __next_line(msg, &mlen, buf, sizeof(buf))) == 1) {
             if (header < 1) {
                 con->track_id = 0;
                 if (SCMP(__STR_OPTIONS, buf))            { con->method = __METHOD_OPTIONS;
@@ -418,6 +476,8 @@ static int __message_proc_sock(struct list_t *e, void *p)
                 } else if (SCMP(__STR_PLAY, buf))        { con->method = __METHOD_PLAY;
                 } else if (SCMP(__STR_RECORDING, buf))   { con->method = __METHOD_RECORDING;
                 } else if (SCMP(__STR_PAUSE, buf))       { con->method = __METHOD_PAUSE;
+                } else if (SCMP(__STR_GET, buf))        { con->method = __METHOD_OPTIONS;
+                } else if (SCMP(__STR_SET, buf))        { con->method = __METHOD_OPTIONS;
                 } else if (SCMP(__STR_TEARDOWN, buf))    { con->method = __METHOD_TEARDOWN;
                 } header++;
             }
@@ -468,6 +528,10 @@ error:
             __PARSE_ERROR(con);
         }
 
+        /* connection died mid-message: detached above, do not dispatch */
+        if (con->con_state == __CON_S_DISCONNECTED)
+            return SUCCESS;
+
         if (con->parser_state == __PARSER_S_ERROR) {
             __method_error(con, h);
         } else {
@@ -483,14 +547,23 @@ error:
                 case __METHOD_RECORDING: __method_record(con, h); break;
                 case __METHOD_TEARDOWN: __method_teardown(con, h); break;
                 case __METHOD_NONE:
-                    /* state DISCONNECTED connections should be garbage collected immediately.
-                       but sending thread might watches the connection right now.
-                       so the connection might live at here */
-                    if (con->con_state != __CON_S_DISCONNECTED) {
+                    /* An empty or unrecognizable request on a session that is
+                     * already streaming (Wi-Fi splits keepalives into tiny TCP
+                     * segments; the fragments reassemble into non-matching
+                     * lines) must NOT kill the session. Answer 501 with the
+                     * last known CSeq so the player counts us as alive and
+                     * keeps buffering; only a cold slot with no session
+                     * deserves teardown. */
+                    if (con->session_id && con->con_state == __CON_S_PLAYING) {
+                        DBG("unknown/empty request on live session, answering 501\n");
+                        __rtsp_write(con, "RTSP/1.0 501 Option not supported\r\n"
+                            "CSeq: %d\r\n\r\n", con->cseq);
+                    } else if (con->con_state != __CON_S_DISCONNECTED) {
                         ERR("unexpected empty request, forcing disconnect\n");
+                        con->close_reason = "unexpected empty request";
                         con->con_state = __CON_S_DISCONNECTED;
+                        ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
                     }
-                    ASSERT(bufpool_detach(con->pool, con) == SUCCESS, ERR("connection detach failed\n"));
                     break;
                 default: ERR("unexpected method state\n"); return FAILURE;
             }
@@ -511,16 +584,35 @@ static int __connection_reset(void *v)
 
     if (p->con_state != __CON_S_DISCONNECTED) {
         DBG("force connection to close\n");
+        p->close_reason = "forced close (pool cleanup)";
     }
 
-    FCLOSE(p->fp_tcp_read);
+    ERR("CON CLOSE %s fd=%d state=%d reason=%s\n",
+        inet_ntoa(p->addr.sin_addr), p->client_fd, p->con_state,
+        p->close_reason ? p->close_reason : "unknown");
+
     FCLOSE(p->fp_tcp_write);
     CLOSE(p->client_fd);
 
     p->client_fd = 0;
     p->con_state = __CON_S_DISCONNECTED;
+    p->close_reason = NULL;
+    p->rxlen = 0;
+    p->reqlen = 0;
 
     for (int i = 0; i < sizeof(p->trans) / sizeof(*p->trans); i++) {
+        /* stale transport state must not leak into a recycled slot:
+         * a previous TCP client must not force a fresh UDP client
+         * back onto interleaved TCP. */
+        p->trans[i].is_tcp = 0;
+        p->trans[i].server_port_rtp = 0;
+        p->trans[i].server_port_rtcp = 0;
+        p->trans[i].client_port_rtp = 0;
+        p->trans[i].client_port_rtcp = 0;
+        p->trans[i].channel_rtp = 0;
+        p->trans[i].channel_rtcp = 0;
+        p->trans[i].drop_until_key = 0;
+
         if (p->trans[i].server_rtcp_fd != 0) {
             CLOSE(p->trans[i].server_rtcp_fd);
             p->trans[i].server_rtcp_fd = 0;
@@ -560,7 +652,6 @@ __connection_list_add(bufpool_handle con_pool, struct list_head_t *head, int fd,
     p->addr=addr;
     p->client_fd=fd;
 
-    ASSERT((p->fp_tcp_read = fdopen(fd, "r")), goto error);
     ASSERT((p->fp_tcp_write = fdopen(fd, "w")), goto error);
 
     p->tx_len = 0;
@@ -751,6 +842,9 @@ static inline int __accept_proc_sock(rtsp_handle h, int server_fd, struct sock_s
                         return FAILURE;}));
             return SUCCESS;
         }
+
+        ERR("CON OPEN from %s:%u fd=%d\n", inet_ntoa(from_addr.sin_addr),
+            ntohs(from_addr.sin_port), fd);
 
         /* set server fd to non-blocking */
         fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);

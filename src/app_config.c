@@ -104,6 +104,13 @@ int app_config_save(void) {
     fprintf(file, "  pin_switch_delay_us: %d\n", app_config.pin_switch_delay_us);
     fprintf(file, "  adc_device: %s\n", app_config.adc_device);
     fprintf(file, "  adc_threshold: %d\n", app_config.adc_threshold);
+    fprintf(file, "  mode: %s\n", app_config.night_mode_cfg);
+    fprintf(file, "  light_source: %s\n", app_config.light_source);
+    fprintf(file, "  dark_gain_tier: %d\n", app_config.dark_gain_tier);
+    fprintf(file, "  dark_exposure_min: %d\n", app_config.dark_exposure_min);
+    fprintf(file, "  bright_gain_tier: %d\n", app_config.bright_gain_tier);
+    fprintf(file, "  bright_exposure_max: %d\n", app_config.bright_exposure_max);
+    fprintf(file, "  switch_hold_s: %d\n", app_config.switch_hold_s);
 
     fprintf(file, "isp:\n");
     fprintf(file, "  mirror: %s\n", app_config.mirror ? "true" : "false");
@@ -280,6 +287,13 @@ enum ConfigError app_config_parse(void) {
     app_config.check_interval_s = 10;
     app_config.adc_device[0] = 0;
     app_config.adc_threshold = 128;
+    app_config.night_mode_cfg[0] = 0;
+    strcpy(app_config.light_source, "gpio");
+    app_config.dark_gain_tier = 9;
+    app_config.dark_exposure_min = 600;
+    app_config.bright_gain_tier = 3;
+    app_config.bright_exposure_max = 200;
+    app_config.switch_hold_s = 300;
 
     struct IniConfig ini;
     memset(&ini, 0, sizeof(struct IniConfig));
@@ -361,13 +375,28 @@ enum ConfigError app_config_parse(void) {
             &ini, "night_mode", "ir_led_pin", 0, PIN_MAX,
             &app_config.ir_led_pin);
         parse_int(
-            &ini, "night_mode", "pin_switch_delay_us", 0, 1000,
+            &ini, "night_mode", "pin_switch_delay_us", 0, 5000,
             &app_config.pin_switch_delay_us);
         parse_param_value(
             &ini, "night_mode", "adc_device", app_config.adc_device);
         parse_int(
             &ini, "night_mode", "adc_threshold", INT_MIN, INT_MAX,
             &app_config.adc_threshold);
+        /* [divinus-142] day/night automation */
+        parse_param_value(
+            &ini, "night_mode", "mode", app_config.night_mode_cfg);
+        parse_param_value(
+            &ini, "night_mode", "light_source", app_config.light_source);
+        parse_int(&ini, "night_mode", "dark_gain_tier", 0, 15,
+            &app_config.dark_gain_tier);
+        parse_int(&ini, "night_mode", "dark_exposure_min", 0, 998,
+            &app_config.dark_exposure_min);
+        parse_int(&ini, "night_mode", "bright_gain_tier", 0, 15,
+            &app_config.bright_gain_tier);
+        parse_int(&ini, "night_mode", "bright_exposure_max", 0, 998,
+            &app_config.bright_exposure_max);
+        parse_int(&ini, "night_mode", "switch_hold_s", 0, 3600,
+            &app_config.switch_hold_s);
     }
 
     err = parse_bool(&ini, "isp", "mirror", &app_config.mirror);
