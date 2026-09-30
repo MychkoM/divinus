@@ -16,7 +16,7 @@
 #include <unistd.h>
 
 rtsp_handle rtspHandle;
-char graceful = 0, keepRunning = 1;
+volatile char graceful = 0, keepRunning = 1;
 
 void handle_error(int signo) {
     char msg[64];
@@ -29,7 +29,7 @@ void handle_error(int signo) {
 void handle_exit(int signo) {
     write(STDERR_FILENO, "Graceful shutdown...\n", 21);
     keepRunning = 0;
-    graceful = 1;
+    graceful = (signo == SIGHUP);
 }
 
 int main(int argc, char *argv[]) {
@@ -73,6 +73,7 @@ int main(int argc, char *argv[]) {
 
     if (app_config.rtsp_enable) {
         rtspHandle = rtsp_create(RTSP_MAXIMUM_CONNECTIONS, app_config.rtsp_port, 1);
+        rtsp_latch_audio_codec();
         HAL_INFO("rtsp", "Started listening for clients...\n");
         if (app_config.rtsp_enable_auth) {
             if (EMPTY(app_config.rtsp_auth_user) || EMPTY(app_config.rtsp_auth_pass))

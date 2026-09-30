@@ -39,6 +39,69 @@ int save_audio_stream(hal_audframe *frame) {
     return EXIT_SUCCESS;
 }
 
+static unsigned char pcm_to_alaw(short pcm)
+{
+    int sign = (pcm & 0x8000) >> 8, s = sign ? -pcm - 1 : pcm, exp = 7;
+    if (s > 32635) s = 32635;
+    if (s >= 256) {
+        for (int m = 0x4000; !(s & m) && exp > 0; m >>= 1) exp--;
+        s = ((exp << 4) | ((s >> (exp + 3)) & 0x0f));
+    } else
+        s >>= 4;
+    return (unsigned char)((s ^ (sign ? 0xd5 : 0x55)));
+}
+
+/* mu-law (G.711 U, PT 0): 4085-step non-uniform compressor. Mirrors the A-law
+ * routine so both stay branch-light for soft-float ARM. */
+static unsigned char pcm_to_ulaw(short pcm)
+{
+    int sign = (pcm >> 8) & 0x80, s = sign ? -pcm : pcm, exp = 7;
+    if (s > 32635) s = 32635;
+    s += 0x84;                         /* bias: mu-law does not encode zero alone */
+    if (s > 0x7FFF) s = 0x7FFF;
+    for (int m = 0x4000; !(s & m) && exp > 0; m >>= 1) exp--;
+    return (unsigned char)~(sign | (exp << 4) | ((s >> (exp + 3)) & 0x0f));
+}
+
+static char rtsp_codec[sizeof(app_config.rtsp_audio_codec)];
+
+/* Any G.711 codec: the 8 kHz sample drop + encode path, versus MP3 */
+static char rtsp_g711_active(void) { return EQUALS(rtsp_codec, "pcma") || EQUALS(rtsp_codec, "pcmu"); }
+
+static void rtsp_pcma_feed(short *pcm, unsigned int samples)
+{
+    static unsigned char alaw[160];
+    static unsigned int fill, phase, step;
+    static int acc, count;
+    char ulaw = EQUALS(rtsp_codec, "pcmu");
+    if (!step) {
+        unsigned int srate = app_config.audio_srate > 0 ? app_config.audio_srate : 8000;
+        step = (srate << 16) / 8000;
+        if (!step) step = 1 << 16;
+    }
+    for (unsigned int i = 0; i < samples; i++) {
+        acc += pcm[i];
+        count++;
+        phase += 1 << 16;
+        if (phase < step) continue;
+        phase -= step;
+        alaw[fill++] = ulaw ? pcm_to_ulaw((short)(acc / count)) : pcm_to_alaw((short)(acc / count));
+        acc = 0; count = 0;
+        if (fill == sizeof(alaw)) {
+            if (ulaw)
+                rtp_send_pcmu(rtspHandle, alaw, sizeof(alaw));
+            else
+                rtp_send_pcma(rtspHandle, alaw, sizeof(alaw));
+            fill = 0;
+        }
+    }
+}
+
+void rtsp_latch_audio_codec(void) {
+    strncpy(rtsp_codec, app_config.rtsp_audio_codec, sizeof(rtsp_codec) - 1);
+    rtsp_codec[sizeof(rtsp_codec) - 1] = 0;
+}
+
 void *aenc_thread(void) {
     static uint8_t frame_buf[AUD_FRAME_MAX + 2];
     const uint32_t mp3FrmSize =
@@ -56,7 +119,7 @@ void *aenc_thread(void) {
             pthread_mutex_lock(&mp4Mtx);
             mp4_ingest_audio(mp3Buf.buf, mp3FrmSize);
             pthread_mutex_unlock(&mp4Mtx);
-            if (app_config.rtsp_enable)
+            if (app_config.rtsp_enable && !rtsp_g711_active())
                 rtp_send_mp3(rtspHandle, mp3Buf.buf, mp3FrmSize);
             rtmp_ingest_audio(mp3Buf.buf, mp3FrmSize);
             mp3Buf.offset -= mp3FrmSize;
@@ -83,6 +146,14 @@ void *aenc_thread(void) {
         outFrame.seq = seq++;
         outFrame.timestamp = millis();
         send_pcm_to_client(&outFrame);
+        if (app_config.rtsp_enable && rtsp_g711_active())
+            rtsp_pcma_feed((short *)(frame_buf + 2), flen / 2);
+
+        if (!record_active() && !app_config.stream_enable && !any_http_audio() &&
+            !(app_config.rtsp_enable && !rtsp_g711_active())) {
+            pcmPos = 0;
+            continue;
+        }
 
         unsigned int pcmLen = flen / 2;
         short *pcmPack = (short *)(frame_buf + 2);
@@ -119,7 +190,7 @@ int save_video_stream(char index, hal_vidstream *stream) {
             if (app_config.mp4_enable) {
                 pthread_mutex_lock(&mp4Mtx);
                 send_mp4_to_client(index, stream, isH265);
-                if (recordOn) send_mp4_to_record(stream, isH265);
+                if (record_active()) record_ingest_stream(stream, isH265);
                 pthread_mutex_unlock(&mp4Mtx);
 
                 send_h26x_to_client(index, stream);
@@ -548,8 +619,12 @@ int media_mjpeg_enable(void) {
 
     if (ret = create_channel(index, app_config.mjpeg_width,
         app_config.mjpeg_height, app_config.mjpeg_fps, 1))
+    {
+        /* Only the slot needs releasing. */
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -582,13 +657,23 @@ int media_mjpeg_enable(void) {
         }
 
         if (ret)
+        {
+            /* Release the channel before clearing the slot. */
+            media_video_disable(index, 1);
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
     }
 
     if (ret = bind_channel(index, app_config.mjpeg_fps, 1))
+    {
+        /* Drop the encoder before releasing the slot. */
+        media_video_disable(index, 1);
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }
@@ -620,8 +705,12 @@ int media_mp4_enable(void) {
 
     if (ret = create_channel(index, app_config.mp4_width,
         app_config.mp4_height, app_config.mp4_fps, 0))
+    {
+        /* Only the slot needs releasing. */
+        chnState[index].enable = false;
         HAL_ERROR("media", "Creating channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     {
         hal_vidconfig config;
@@ -657,8 +746,13 @@ int media_mp4_enable(void) {
         }
 
         if (ret)
+        {
+            /* Release the channel before clearing the slot. */
+            media_video_disable(index, 0);
+            chnState[index].enable = false;
             HAL_ERROR("media", "Creating encoder %d failed with %#x!\n%s\n",
                 index, ret, errstr(ret));
+        }
 
         mp4_set_config(app_config.mp4_width, app_config.mp4_height, app_config.mp4_fps,
             app_config.audio_enable ? HAL_AUDCODEC_MP3 : HAL_AUDCODEC_UNSPEC,
@@ -666,8 +760,13 @@ int media_mp4_enable(void) {
     }
 
     if (ret = bind_channel(index, app_config.mp4_fps, 0))
+    {
+        /* Drop the encoder before releasing the slot. */
+        media_video_disable(index, 0);
+        chnState[index].enable = false;
         HAL_ERROR("media", "Binding channel %d failed with %#x!\n%s\n",
             index, ret, errstr(ret));
+    }
 
     return EXIT_SUCCESS;
 }
